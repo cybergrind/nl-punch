@@ -1,0 +1,30 @@
+{
+  "session_id": "CHANGE-ME-to-a-unique-session-id",
+  "signaling": {
+    "url": "http://signaling.example.com:8901/punch",
+    "shared_secret": "${NLPUNCH_SECRET}"
+  },
+  "ice": {
+    "stun": [
+      "stun.cloudflare.com:3478",
+      "stun.l.google.com:19302",
+      "stun.nextcloud.com:443"
+    ],
+    "turn": []
+  },
+  "transport": {
+    "profile": "low-latency"
+  },
+  "peers": {
+    "peer-a": {
+      "listen": [
+        {"local_port": 8080, "remote_port": 8080, "name": "http"}
+      ]
+    },
+    "peer-b": {
+      "dial": [
+        {"local_port": 8080, "name": "http"}
+      ]
+    }
+  }
+}
