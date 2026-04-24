@@ -11,6 +11,12 @@ import (
 // pair creates a connected pair of Sessions over loopback UDP.
 // Peer A is the yamux/KCP server; B is the client.
 func pair(t *testing.T) (a, b *Session) {
+	return pairWithProfile(t, Profile("low-latency"))
+}
+
+// pairWithProfile is pair() but with an explicit KCP profile so individual
+// tests can compare behavior across presets.
+func pairWithProfile(t *testing.T, prof KCPProfile) (a, b *Session) {
 	t.Helper()
 	pcA, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {
@@ -20,7 +26,6 @@ func pair(t *testing.T) (a, b *Session) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	prof := Profile("low-latency")
 
 	type res struct {
 		s   *Session
@@ -157,6 +162,139 @@ func TestSession_multipleConcurrentStreams(t *testing.T) {
 	wg.Wait()
 }
 
+// TestSession_bulkServerPush_afterClientHeader mirrors the bench's
+// throughput-down shape at the transport layer: open one stream from the
+// client, have the client write a tiny header, then have the server write
+// a large payload. Reproduces the round-E finding that bytes pushed by
+// the server after the client's header didn't arrive at the client.
+func TestSession_bulkServerPush_afterClientHeader(t *testing.T) {
+	a, b := pairWithProfile(t, Profile("low-latency"))
+
+	const payloadSize = 512 * 1024
+
+	done := make(chan error, 1)
+	go func() {
+		s, err := a.AcceptStream()
+		if err != nil {
+			done <- err
+			return
+		}
+		defer s.Close()
+		var hdr [5]byte
+		if _, err := io.ReadFull(s, hdr[:]); err != nil {
+			done <- err
+			return
+		}
+		payload := make([]byte, payloadSize)
+		for i := range payload {
+			payload[i] = byte(i * 7)
+		}
+		if _, err := s.Write(payload); err != nil {
+			done <- err
+			return
+		}
+		// s.Close() via defer will half/full-close so client sees EOF.
+		done <- nil
+	}()
+
+	s, err := b.OpenStream()
+	if err != nil {
+		t.Fatalf("OpenStream: %v", err)
+	}
+	if _, err := s.Write([]byte{'U', 0, 0, 0, 5}); err != nil {
+		t.Fatalf("Write header: %v", err)
+	}
+	s.SetReadDeadline(time.Now().Add(10 * time.Second))
+	got, err := io.ReadAll(s)
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+	if len(got) != payloadSize {
+		t.Fatalf("received %d bytes, want %d", len(got), payloadSize)
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("server: %v", err)
+	}
+}
+
+// TestSession_continuousServerPush mirrors exactly what the bench does:
+// server writes in a loop for ~dur instead of one big s.Write. Goal is
+// to reproduce the real-world throughput-down behavior locally.
+func TestSession_continuousServerPush(t *testing.T) {
+	a, b := pairWithProfile(t, Profile("low-latency"))
+	const dur = 500 * time.Millisecond
+
+	type result struct{ wrote uint64; err error }
+	svDone := make(chan result, 1)
+	go func() {
+		s, err := a.AcceptStream()
+		if err != nil {
+			svDone <- result{0, err}
+			return
+		}
+		defer s.Close()
+		var hdr [5]byte
+		if _, err := io.ReadFull(s, hdr[:]); err != nil {
+			svDone <- result{0, err}
+			return
+		}
+		buf := make([]byte, 64*1024)
+		deadline := time.Now().Add(dur)
+		var wrote uint64
+		for time.Now().Before(deadline) {
+			n, err := s.Write(buf)
+			wrote += uint64(n)
+			if err != nil {
+				svDone <- result{wrote, err}
+				return
+			}
+		}
+		svDone <- result{wrote, nil}
+	}()
+
+	s, err := b.OpenStream()
+	if err != nil {
+		t.Fatalf("OpenStream: %v", err)
+	}
+	if _, err := s.Write([]byte{'U', 0, 0, 0, 5}); err != nil {
+		t.Fatalf("Write header: %v", err)
+	}
+	s.SetReadDeadline(time.Now().Add(dur + 5*time.Second))
+	got, err := io.ReadAll(s)
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+	sv := <-svDone
+	if sv.err != nil {
+		t.Fatalf("server: %v (wrote %d)", sv.err, sv.wrote)
+	}
+	if uint64(len(got)) != sv.wrote {
+		t.Fatalf("client got %d, server wrote %d — bytes lost in transit", len(got), sv.wrote)
+	}
+	t.Logf("server wrote %d bytes in %v, client received all of it", sv.wrote, dur)
+}
+
+// TestYamuxConfig_keepAliveIntervalKeepsICEWarm pins the contract that our
+// yamux keepalive fires often enough to be a reliable keep-warm signal for
+// the underlying pion/ICE path. Anything larger than a couple of seconds
+// leaves long silent windows on one side under asymmetric read-only loads
+// (the throughput-down bug in round F), so we require ≤ 2 s.
+func TestYamuxConfig_keepAliveIntervalKeepsICEWarm(t *testing.T) {
+	c := yamuxConfig()
+	if !c.EnableKeepAlive {
+		t.Fatalf("EnableKeepAlive=false; we rely on yamux pings as the keep-warm signal for pion/ICE")
+	}
+	if c.KeepAliveInterval > 2*time.Second {
+		t.Errorf("KeepAliveInterval=%v, want ≤ 2s so a read-only peer still emits outbound UDP often enough for ICE receive to stay healthy", c.KeepAliveInterval)
+	}
+	// Sanity: the write timeout must stay well above the interval so a
+	// single stalled Ping doesn't immediately kill the session.
+	if c.ConnectionWriteTimeout < 10*c.KeepAliveInterval {
+		t.Errorf("ConnectionWriteTimeout=%v < 10× KeepAliveInterval=%v; session would die on brief backpressure",
+			c.ConnectionWriteTimeout, c.KeepAliveInterval)
+	}
+}
+
 func TestProfile_lowLatencyDefault(t *testing.T) {
 	// Unknown name → low-latency preset.
 	p := Profile("never-heard-of-it")
@@ -174,10 +312,17 @@ func TestProfile_distinctPresets(t *testing.T) {
 		t.Errorf("intervals not monotonically increasing: lo=%d bal=%d bw=%d",
 			lo.Interval, bal.Interval, bw.Interval)
 	}
-	if lo.NC != 1 {
-		t.Errorf("low-latency NC=%d, want 1 (no congestion control)", lo.NC)
+	// low-latency used to run with NC=1 (no cwnd) but that flooded
+	// asymmetric uplinks and killed the tunnel under sustained writes.
+	// It now matches "bandwidth" in having cwnd on — the distinguishing
+	// traits are shorter Interval and aggressive fast-resend.
+	if lo.NC != 0 {
+		t.Errorf("low-latency NC=%d, want 0 (cwnd on to avoid flooding)", lo.NC)
 	}
 	if bw.NC != 0 {
 		t.Errorf("bandwidth NC=%d, want 0 (cwnd on)", bw.NC)
+	}
+	if lo.Resend != 2 {
+		t.Errorf("low-latency Resend=%d, want 2 (fast rexmit on)", lo.Resend)
 	}
 }

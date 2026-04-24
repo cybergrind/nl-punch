@@ -24,13 +24,19 @@ type Session struct {
 	owned net.PacketConn // only set when we should close it ourselves
 }
 
-// yamuxConfig returns our tuned yamux config. Keepalive is enabled so both
-// sides detect a dead ICE link within ~30s.
+// yamuxConfig returns our tuned yamux config. Keepalive is enabled with a
+// short interval because yamux Pings are our only guaranteed outbound
+// signal when one side is read-only (e.g. during a bulk server→client
+// transfer). In Round F we observed that a peer sitting quiet for >1 s
+// had its pion/ICE receive path stall, starving the inbound KCP stream;
+// a 1 s Ping cadence keeps outbound UDP flowing from every peer at all
+// times and restored server→client flow. ConnectionWriteTimeout stays
+// generous so a single stalled Ping doesn't take the session down.
 func yamuxConfig() *yamux.Config {
 	c := yamux.DefaultConfig()
 	c.EnableKeepAlive = true
-	c.KeepAliveInterval = 10 * time.Second
-	c.ConnectionWriteTimeout = 15 * time.Second
+	c.KeepAliveInterval = 1 * time.Second
+	c.ConnectionWriteTimeout = 60 * time.Second
 	return c
 }
 

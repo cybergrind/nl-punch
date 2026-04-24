@@ -228,6 +228,84 @@ func itoa(n int) string {
 	return string(buf[i:])
 }
 
+// TestBulkServerPush_afterClientHeader exercises the throughput-down shape:
+// the client opens a TCP connection, writes a tiny header, then only reads;
+// the server reads the header, then writes a large payload and closes.
+// Pins that server-initiated bulk bytes on a stream that the *client* opened
+// make it all the way back to the client — the symptom we saw in round-E
+// was that this direction delivered 0 bytes.
+func TestBulkServerPush_afterClientHeader(t *testing.T) {
+	svSess, clSess := yamuxPair(t)
+	log := quietLogger()
+
+	const wantBytes = 1 << 20 // 1 MiB
+	serverPort := startServerPushTCP(t, wantBytes)
+
+	acc := NewAcceptRouter(svSess, map[string]int{"push": serverPort}, log)
+	go acc.Run()
+	t.Cleanup(func() { acc.Close() })
+
+	lst := NewTCPListener(clSess, []ListenSpec{{Name: "push", LocalPort: 0, RemotePort: serverPort}}, log)
+	if err := lst.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { lst.Close() })
+
+	port := lst.BoundPorts()["push"]
+	c, err := net.Dial("tcp", net.JoinHostPort("127.0.0.1", itoa(port)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	c.SetDeadline(time.Now().Add(10 * time.Second))
+
+	// Tiny 5-byte header (mimics bench-client's modeUpload + 4-byte duration).
+	if _, err := c.Write([]byte{'U', 0, 0, 0, 5}); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := io.ReadAll(c)
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+	if len(got) != wantBytes {
+		t.Fatalf("server push delivered %d bytes, want %d", len(got), wantBytes)
+	}
+}
+
+// startServerPushTCP starts a TCP server that, for every connection, reads a
+// 5-byte header and then writes exactly `payloadSize` bytes back and closes.
+func startServerPushTCP(t *testing.T, payloadSize int) int {
+	t.Helper()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { l.Close() })
+	go func() {
+		for {
+			c, err := l.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				var hdr [5]byte
+				if _, err := io.ReadFull(c, hdr[:]); err != nil {
+					return
+				}
+				// Write a deterministic blob so size is the only invariant.
+				payload := make([]byte, payloadSize)
+				for i := range payload {
+					payload[i] = byte(i * 13)
+				}
+				_, _ = c.Write(payload)
+			}(c)
+		}
+	}()
+	return l.Addr().(*net.TCPAddr).Port
+}
+
 func TestMain(m *testing.M) {
 	// Keep yamux logs out of test output.
 	os.Stderr = os.Stderr

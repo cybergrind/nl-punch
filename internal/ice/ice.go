@@ -11,6 +11,8 @@ package ice
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"log/slog"
 	"net"
@@ -167,11 +169,21 @@ func (a *Agent) Connect(ctx context.Context) (*pionice.Conn, error) {
 
 	// Exchange offer/answer via signaling. Controlling side POSTs its offer
 	// and waits for the controlled side's answer. Controlled side waits
-	// for the controlling side's offer, then POSTs its own answer.
+	// for the controlling side's offer, then POSTs its own answer. A
+	// per-attempt nonce (Gen) binds the offer/answer pair so a peer can
+	// reject a stale answer left on the signaling server from a previous
+	// attempt (or posted by a peer-b that read a stale offer during a
+	// simultaneous-restart race). peer-a mints the Gen; peer-b echoes it.
+	myGen, err := newGen()
+	if err != nil {
+		agent.Close()
+		return nil, fmt.Errorf("newGen: %w", err)
+	}
 	myOffer := signaling.Offer{
 		Ufrag:      ufrag,
 		Pwd:        pwd,
 		Candidates: localCands,
+		Gen:        myGen,
 	}
 
 	var peer signaling.Offer
@@ -180,7 +192,7 @@ func (a *Agent) Connect(ctx context.Context) (*pionice.Conn, error) {
 			agent.Close()
 			return nil, fmt.Errorf("post offer: %w", err)
 		}
-		peer, err = a.cfg.Signaling.AwaitAnswer(ctx, a.cfg.SessionID, a.cfg.PollInterval)
+		peer, err = a.cfg.Signaling.AwaitAnswerMatching(ctx, a.cfg.SessionID, a.cfg.PollInterval, myGen)
 		if err != nil {
 			agent.Close()
 			return nil, fmt.Errorf("await answer: %w", err)
@@ -192,6 +204,8 @@ func (a *Agent) Connect(ctx context.Context) (*pionice.Conn, error) {
 			agent.Close()
 			return nil, fmt.Errorf("await offer: %w", err)
 		}
+		// Echo peer-a's Gen so peer-a can match the pair.
+		myOffer.Gen = peer.Gen
 		if err := a.cfg.Signaling.PostAnswer(ctx, a.cfg.SessionID, myOffer); err != nil {
 			agent.Close()
 			return nil, fmt.Errorf("post answer: %w", err)
@@ -236,6 +250,16 @@ func parseURLs(stunHosts []string, turnServers []TURNServer) ([]*stun.URI, error
 		out = append(out, u)
 	}
 	return out, nil
+}
+
+// newGen returns a short random hex string used as a per-attempt binding
+// nonce between offer and answer.
+func newGen() (string, error) {
+	var b [8]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b[:]), nil
 }
 
 // PacketConnAdapter wraps an *ice.Conn as a net.PacketConn with a fixed

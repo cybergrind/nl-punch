@@ -35,10 +35,15 @@ func Profile(name string) KCPProfile {
 	case "low-latency":
 		fallthrough
 	default:
-		// Aggressive: 10ms tick, fast resend after 2 dup ACKs, no cwnd.
+		// Aggressive on rexmit (10 ms tick, fast resend after 2 dup ACKs).
+		// Congestion control ENABLED (NC=0) — the original NC=1 flooded
+		// asymmetric home-ISP uplinks, starved return-path ACKs and yamux
+		// keepalives, and killed the tunnel within ~15 s of sustained
+		// writes. Window trimmed to 128/256 pkts so that even a brief
+		// oversend can't saturate the uplink beyond what cwnd allows.
 		return KCPProfile{
-			NoDelay: 1, Interval: 10, Resend: 2, NC: 1,
-			SendWindow: 1024, RecvWindow: 1024,
+			NoDelay: 1, Interval: 10, Resend: 2, NC: 0,
+			SendWindow: 128, RecvWindow: 256,
 		}
 	}
 }

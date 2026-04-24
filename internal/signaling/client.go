@@ -146,12 +146,24 @@ func (c *Client) AwaitOffer(ctx context.Context, sessionID, role string, every t
 
 // AwaitAnswer mirrors AwaitOffer.
 func (c *Client) AwaitAnswer(ctx context.Context, sessionID string, every time.Duration) (Answer, error) {
+	return c.AwaitAnswerMatching(ctx, sessionID, every, "")
+}
+
+// AwaitAnswerMatching polls GetAnswer until a non-ErrNotFound answer is
+// available whose Gen equals wantGen (when wantGen is non-empty). An
+// empty wantGen accepts any answer (back-compat behavior). A non-matching
+// answer is treated the same as "not found" — keep polling — so a stale
+// leftover from a prior attempt or a concurrent peer-b cycle doesn't
+// short-circuit the handshake.
+func (c *Client) AwaitAnswerMatching(ctx context.Context, sessionID string, every time.Duration, wantGen string) (Answer, error) {
 	for {
 		a, err := c.GetAnswer(ctx, sessionID)
 		if err == nil {
-			return a, nil
-		}
-		if !IsNotFound(err) {
+			if wantGen == "" || a.Gen == wantGen {
+				return a, nil
+			}
+			// Mismatched gen: stale answer. Keep polling.
+		} else if !IsNotFound(err) {
 			return Answer{}, err
 		}
 		select {

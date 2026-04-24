@@ -68,6 +68,11 @@ func (s *Server) handleOffer(w http.ResponseWriter, r *http.Request) {
 		}
 		s.mu.Lock()
 		s.offers[body.SessionID+"|"+body.Role] = body.Offer
+		// A new offer invalidates any prior answer for this session: on a
+		// reconnect after a dead session, the old answer carries the peer's
+		// stale ufrag/pwd/candidates and would make ICE connectivity checks
+		// fail for ~90s. Clearing it forces the peer to re-post fresh.
+		delete(s.answers, body.SessionID)
 		s.mu.Unlock()
 		w.WriteHeader(http.StatusNoContent)
 
