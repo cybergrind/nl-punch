@@ -307,8 +307,10 @@ func startServerPushTCP(t *testing.T, payloadSize int) int {
 }
 
 func TestMain(m *testing.M) {
-	// Keep yamux logs out of test output.
-	os.Stderr = os.Stderr
+	// Left intentionally thin: every test wires its own helpers. The
+	// zero-value uses of os/sync are just to keep the imports pinned
+	// for tests that reference them.
+	_ = os.Stderr
 	_ = sync.Mutex{}
 	os.Exit(m.Run())
 }

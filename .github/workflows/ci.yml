@@ -1,0 +1,103 @@
+name: CI
+
+# Runs on every push / PR to main. Lightweight: tests + cross-compile each
+# target and check artifacts are ready, but no version bump or release.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  GO_VERSION_FILE: go.mod
+  CMDS: "nl-punch nl-punch-signaling nl-punch-bench"
+  TARGETS: "linux-amd64 linux-arm64 darwin-arm64"
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: ${{ env.GO_VERSION_FILE }}
+          cache: true
+      - name: go vet
+        run: go vet ./...
+      - name: go test
+        run: go test -timeout 120s ./...
+
+  build:
+    name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
+    runs-on: ubuntu-latest
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
+          - goos: darwin
+            goarch: arm64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: ${{ env.GO_VERSION_FILE }}
+          cache: true
+      - name: Cross-compile
+        env:
+          CGO_ENABLED: "0"
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          for cmd in $CMDS; do
+            out="dist/${cmd}-${GOOS}-${GOARCH}"
+            go build -trimpath -ldflags '-s -w' -o "$out" "./cmd/${cmd}"
+            test -s "$out" || { echo "::error::$out is empty"; exit 1; }
+          done
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  verify-artifacts:
+    name: Verify all artifacts
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist-staging
+          pattern: dist-*
+          merge-multiple: true
+      - name: Check all expected binaries exist and are non-empty
+        run: |
+          set -euo pipefail
+          missing=0
+          for tgt in $TARGETS; do
+            for cmd in $CMDS; do
+              path="dist-staging/${cmd}-${tgt}"
+              if [ ! -s "$path" ]; then
+                echo "::error::missing or empty artifact: $path"
+                missing=$((missing + 1))
+              else
+                size=$(stat -c %s "$path" 2>/dev/null || stat -f %z "$path")
+                echo "ok  $path  $size bytes"
+              fi
+            done
+          done
+          if [ "$missing" -ne 0 ]; then
+            echo "::error::$missing artifact(s) missing"
+            exit 1
+          fi

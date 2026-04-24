@@ -1,0 +1,170 @@
+name: Release
+
+# Single entry point for cutting a versioned release:
+#   - run the full test suite
+#   - cross-compile each binary for linux/amd64, linux/arm64, darwin/arm64
+#   - verify every expected artifact is present and non-empty
+#   - bump VERSION (patch/minor/major), tag, and attach artifacts to a
+#     GitHub Release
+#
+# Triggered manually via "Run workflow" in the GitHub UI.
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: "Semver segment to bump"
+        required: true
+        type: choice
+        default: patch
+        options:
+          - patch
+          - minor
+          - major
+
+permissions:
+  contents: write  # needed to push the version bump commit/tag and create the Release.
+
+env:
+  GO_VERSION_FILE: go.mod
+  CMDS: "nl-punch nl-punch-signaling nl-punch-bench"
+  TARGETS: "linux-amd64 linux-arm64 darwin-arm64"
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: ${{ env.GO_VERSION_FILE }}
+          cache: true
+      - name: Run tests
+        run: go test -timeout 120s ./...
+
+  build:
+    name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
+    runs-on: ubuntu-latest
+    needs: test
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
+          - goos: darwin
+            goarch: arm64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: ${{ env.GO_VERSION_FILE }}
+          cache: true
+      - name: Cross-compile
+        env:
+          CGO_ENABLED: "0"
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          mkdir -p dist
+          for cmd in $CMDS; do
+            out="dist/${cmd}-${GOOS}-${GOARCH}"
+            echo "building $out"
+            go build -trimpath -ldflags '-s -w' -o "$out" "./cmd/${cmd}"
+          done
+          ls -la dist/
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Tag + Release
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # need full history so we can push the version commit.
+
+      - name: Bump VERSION
+        id: bump
+        run: |
+          set -euo pipefail
+          current=$(cat VERSION | tr -d '[:space:]')
+          IFS='.' read -r maj min pat <<< "$current"
+          case "${{ inputs.bump }}" in
+            major) maj=$((maj + 1)); min=0; pat=0 ;;
+            minor) min=$((min + 1)); pat=0 ;;
+            patch) pat=$((pat + 1)) ;;
+          esac
+          new="${maj}.${min}.${pat}"
+          echo "$new" > VERSION
+          echo "previous=${current}" >> "$GITHUB_OUTPUT"
+          echo "version=${new}" >> "$GITHUB_OUTPUT"
+          echo "tag=v${new}" >> "$GITHUB_OUTPUT"
+          echo "Bumping ${current} -> ${new}"
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist-staging
+          pattern: dist-*
+          merge-multiple: true
+
+      - name: Verify artifacts
+        run: |
+          set -euo pipefail
+          missing=0
+          for tgt in $TARGETS; do
+            for cmd in $CMDS; do
+              path="dist-staging/${cmd}-${tgt}"
+              if [ ! -s "$path" ]; then
+                echo "::error::missing or empty artifact: $path"
+                missing=$((missing + 1))
+              else
+                size=$(stat -c %s "$path" 2>/dev/null || stat -f %z "$path")
+                echo "ok  $path  $size bytes"
+              fi
+            done
+          done
+          if [ "$missing" -ne 0 ]; then
+            echo "::error::$missing artifact(s) missing"
+            exit 1
+          fi
+          echo "all 9 expected artifacts present"
+
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Commit + tag
+        run: |
+          set -euo pipefail
+          git add VERSION
+          git commit -m "release: v${{ steps.bump.outputs.version }}"
+          git tag -a "${{ steps.bump.outputs.tag }}" -m "release ${{ steps.bump.outputs.tag }}"
+          git push origin HEAD:${{ github.ref_name }}
+          git push origin "${{ steps.bump.outputs.tag }}"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.bump.outputs.tag }}
+          name: ${{ steps.bump.outputs.tag }}
+          body: |
+            Automated release: bumped `${{ steps.bump.outputs.previous }}` → `${{ steps.bump.outputs.version }}`.
+
+            Artifacts (one binary per target, ${{ env.CMDS }}):
+
+            - `linux/amd64`, `linux/arm64`, `darwin/arm64`
+          files: dist-staging/*
+          draft: false
+          prerelease: false
