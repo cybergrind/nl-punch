@@ -1,15 +1,23 @@
 name: Release
 
-# Single entry point for cutting a versioned release:
-#   - run the full test suite
-#   - cross-compile each binary for linux/amd64, linux/arm64, darwin/arm64
-#   - verify every expected artifact is present and non-empty
-#   - bump VERSION (patch/minor/major), tag, and attach artifacts to a
-#     GitHub Release
+# Two ways to cut a release:
 #
-# Triggered manually via "Run workflow" in the GitHub UI.
+# 1. Push a semver tag (e.g. `git tag 0.2.0 && git push origin 0.2.0`).
+#    The workflow uses the tag name verbatim as the release version.
+#    The tag must be reachable from `main`.
+#
+# 2. Manual "Run workflow" from the GitHub UI with a `bump` input
+#    (patch/minor/major). The workflow reads VERSION, bumps it,
+#    commits the bump on the current branch, creates the tag, pushes,
+#    then builds and releases.
+#
+# Both paths share the test → build → verify → publish pipeline below.
 
 on:
+  push:
+    tags:
+      - "[0-9]+.[0-9]+.[0-9]+"
+      - "v[0-9]+.[0-9]+.[0-9]+"
   workflow_dispatch:
     inputs:
       bump:
@@ -23,7 +31,7 @@ on:
           - major
 
 permissions:
-  contents: write  # needed to push the version bump commit/tag and create the Release.
+  contents: write
 
 env:
   GO_VERSION_FILE: go.mod
@@ -31,18 +39,81 @@ env:
   TARGETS: "linux-amd64 linux-arm64 darwin-arm64"
 
 jobs:
+  # --------------------------------------------------------------------
+  # Resolve which path we're on and produce `version` + `tag` outputs
+  # that the rest of the pipeline consumes.
+  # --------------------------------------------------------------------
+  plan:
+    name: Resolve version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+      tag: ${{ steps.resolve.outputs.tag }}
+      previous: ${{ steps.resolve.outputs.previous }}
+      needs_bump: ${{ steps.resolve.outputs.needs_bump }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve version from trigger
+        id: resolve
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "push" ]; then
+            # Tag push path: tag name is authoritative. Strip optional leading v.
+            tag="${GITHUB_REF_NAME}"
+            version="${tag#v}"
+
+            # Enforce "on main branch" convention: the tagged commit must
+            # be reachable from main. (`git branch --contains` lists local
+            # branches; after a fresh clone we only have the default branch.)
+            default_branch="${{ github.event.repository.default_branch }}"
+            git fetch --no-tags origin "$default_branch"
+            if ! git merge-base --is-ancestor "$GITHUB_SHA" "origin/${default_branch}"; then
+              echo "::error::tag ${tag} is not reachable from origin/${default_branch}; push the tag only after the commit is on ${default_branch}"
+              exit 1
+            fi
+
+            echo "tag=${tag}"             >> "$GITHUB_OUTPUT"
+            echo "version=${version}"     >> "$GITHUB_OUTPUT"
+            echo "previous="              >> "$GITHUB_OUTPUT"
+            echo "needs_bump=false"       >> "$GITHUB_OUTPUT"
+          else
+            # Manual path: bump VERSION.
+            previous=$(cat VERSION | tr -d '[:space:]')
+            IFS='.' read -r maj min pat <<< "$previous"
+            case "${{ inputs.bump }}" in
+              major) maj=$((maj + 1)); min=0; pat=0 ;;
+              minor) min=$((min + 1)); pat=0 ;;
+              patch) pat=$((pat + 1)) ;;
+            esac
+            version="${maj}.${min}.${pat}"
+            echo "tag=${version}"         >> "$GITHUB_OUTPUT"
+            echo "version=${version}"     >> "$GITHUB_OUTPUT"
+            echo "previous=${previous}"   >> "$GITHUB_OUTPUT"
+            echo "needs_bump=true"        >> "$GITHUB_OUTPUT"
+          fi
+
+  # --------------------------------------------------------------------
+  # Standard CI gate.
+  # --------------------------------------------------------------------
   test:
     name: Test
     runs-on: ubuntu-latest
+    needs: plan
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
           go-version-file: ${{ env.GO_VERSION_FILE }}
           cache: true
-      - name: Run tests
-        run: go test -timeout 120s ./...
+      - run: go vet ./...
+      - run: go test -timeout 120s ./...
 
+  # --------------------------------------------------------------------
+  # Cross-compile every (cmd × target) combination. One job per target.
+  # --------------------------------------------------------------------
   build:
     name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
     runs-on: ubuntu-latest
@@ -68,48 +139,34 @@ jobs:
           CGO_ENABLED: "0"
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
+          VERSION: ${{ needs.plan.outputs.version }}
         run: |
+          set -euo pipefail
           mkdir -p dist
           for cmd in $CMDS; do
             out="dist/${cmd}-${GOOS}-${GOARCH}"
-            echo "building $out"
             go build -trimpath -ldflags '-s -w' -o "$out" "./cmd/${cmd}"
+            test -s "$out" || { echo "::error::$out is empty"; exit 1; }
           done
           ls -la dist/
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
           name: dist-${{ matrix.goos }}-${{ matrix.goarch }}
           path: dist/
           if-no-files-found: error
           retention-days: 7
 
+  # --------------------------------------------------------------------
+  # Pull all artifacts together and publish.
+  # --------------------------------------------------------------------
   release:
-    name: Tag + Release
+    name: Publish ${{ needs.plan.outputs.tag }}
     runs-on: ubuntu-latest
-    needs: build
+    needs: [plan, build]
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0  # need full history so we can push the version commit.
-
-      - name: Bump VERSION
-        id: bump
-        run: |
-          set -euo pipefail
-          current=$(cat VERSION | tr -d '[:space:]')
-          IFS='.' read -r maj min pat <<< "$current"
-          case "${{ inputs.bump }}" in
-            major) maj=$((maj + 1)); min=0; pat=0 ;;
-            minor) min=$((min + 1)); pat=0 ;;
-            patch) pat=$((pat + 1)) ;;
-          esac
-          new="${maj}.${min}.${pat}"
-          echo "$new" > VERSION
-          echo "previous=${current}" >> "$GITHUB_OUTPUT"
-          echo "version=${new}" >> "$GITHUB_OUTPUT"
-          echo "tag=v${new}" >> "$GITHUB_OUTPUT"
-          echo "Bumping ${current} -> ${new}"
+          fetch-depth: 0
 
       - name: Download artifacts
         uses: actions/download-artifact@v4
@@ -138,33 +195,34 @@ jobs:
             echo "::error::$missing artifact(s) missing"
             exit 1
           fi
-          echo "all 9 expected artifacts present"
+          echo "all 9 expected artifacts present for ${{ needs.plan.outputs.tag }}"
 
-      - name: Configure git identity
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-      - name: Commit + tag
+      # Manual-dispatch path only: rewrite VERSION, commit, tag, push.
+      # Tag-push path skips this — the tag already exists.
+      - name: Commit version bump + tag (manual dispatch only)
+        if: needs.plan.outputs.needs_bump == 'true'
         run: |
           set -euo pipefail
+          echo "${{ needs.plan.outputs.version }}" > VERSION
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add VERSION
-          git commit -m "release: v${{ steps.bump.outputs.version }}"
-          git tag -a "${{ steps.bump.outputs.tag }}" -m "release ${{ steps.bump.outputs.tag }}"
-          git push origin HEAD:${{ github.ref_name }}
-          git push origin "${{ steps.bump.outputs.tag }}"
+          git commit -m "release: ${{ needs.plan.outputs.version }}"
+          git tag -a "${{ needs.plan.outputs.tag }}" -m "release ${{ needs.plan.outputs.tag }}"
+          git push origin "HEAD:${{ github.ref_name }}"
+          git push origin "${{ needs.plan.outputs.tag }}"
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.bump.outputs.tag }}
-          name: ${{ steps.bump.outputs.tag }}
+          tag_name: ${{ needs.plan.outputs.tag }}
+          name: ${{ needs.plan.outputs.tag }}
           body: |
-            Automated release: bumped `${{ steps.bump.outputs.previous }}` → `${{ steps.bump.outputs.version }}`.
+            Automated release ${{ needs.plan.outputs.tag }}.
 
-            Artifacts (one binary per target, ${{ env.CMDS }}):
+            ${{ needs.plan.outputs.previous && format('Bumped `{0}` → `{1}`.', needs.plan.outputs.previous, needs.plan.outputs.version) || '' }}
 
-            - `linux/amd64`, `linux/arm64`, `darwin/arm64`
+            Artifacts: each of `nl-punch`, `nl-punch-signaling`, `nl-punch-bench` for `linux/amd64`, `linux/arm64`, `darwin/arm64`.
           files: dist-staging/*
           draft: false
           prerelease: false
