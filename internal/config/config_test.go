@@ -17,9 +17,6 @@ const sampleConfig = `{
     "stun": ["stun.l.google.com:19302"],
     "turn": []
   },
-  "transport": {
-    "profile": "low-latency"
-  },
   "peers": {
     "peer-a": {
       "listen": [
@@ -64,10 +61,6 @@ func TestLoad_parsesFullConfig(t *testing.T) {
 	if len(cfg.ICE.STUN) != 1 || cfg.ICE.STUN[0] != "stun.l.google.com:19302" {
 		t.Errorf("STUN = %v", cfg.ICE.STUN)
 	}
-	if cfg.Transport.Profile != "low-latency" {
-		t.Errorf("profile = %q, want low-latency", cfg.Transport.Profile)
-	}
-
 	a, ok := cfg.Peers["peer-a"]
 	if !ok {
 		t.Fatal("peer-a missing")
@@ -117,23 +110,6 @@ func TestLoad_defaultSTUNHasDiverseProviders(t *testing.T) {
 	}
 }
 
-func TestLoad_defaultsTransportProfile(t *testing.T) {
-	// Profile omitted → low-latency default.
-	body := `{
-      "session_id": "s",
-      "signaling": {"url": "http://x"},
-      "peers": {"peer-a": {}, "peer-b": {}}
-    }`
-	p := writeConfig(t, body)
-	cfg, err := Load(p)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if cfg.Transport.Profile != "low-latency" {
-		t.Errorf("default profile = %q, want low-latency", cfg.Transport.Profile)
-	}
-}
-
 func TestLoad_validateStreamNameUniqueness(t *testing.T) {
 	body := `{
       "session_id": "s",
@@ -164,20 +140,6 @@ func TestLoad_validateRoleStructure(t *testing.T) {
 	_, err := Load(p)
 	if err == nil {
 		t.Fatal("expected error for unknown peer role")
-	}
-}
-
-func TestLoad_validateInvalidProfile(t *testing.T) {
-	body := `{
-      "session_id": "s",
-      "signaling": {"url": "http://x"},
-      "transport": {"profile": "ludicrous-speed"},
-      "peers": {"peer-a": {}, "peer-b": {}}
-    }`
-	p := writeConfig(t, body)
-	_, err := Load(p)
-	if err == nil {
-		t.Fatal("expected error for invalid profile")
 	}
 }
 

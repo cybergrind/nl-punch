@@ -11,7 +11,6 @@ type Config struct {
 	SessionID string          `json:"session_id"`
 	Signaling SignalingConfig `json:"signaling"`
 	ICE       ICEConfig       `json:"ice"`
-	Transport TransportConfig `json:"transport"`
 	Peers     map[string]Peer `json:"peers"`
 }
 
@@ -29,10 +28,6 @@ type TURNServer struct {
 	URI  string `json:"uri"`
 	User string `json:"user"`
 	Pass string `json:"pass"`
-}
-
-type TransportConfig struct {
-	Profile string `json:"profile"`
 }
 
 type Peer struct {
@@ -54,17 +49,7 @@ type DialSpec struct {
 const (
 	RolePeerA = "peer-a"
 	RolePeerB = "peer-b"
-
-	ProfileLowLatency = "low-latency"
-	ProfileBalanced   = "balanced"
-	ProfileBandwidth  = "bandwidth"
 )
-
-var validProfiles = map[string]bool{
-	ProfileLowLatency: true,
-	ProfileBalanced:   true,
-	ProfileBandwidth:  true,
-}
 
 // Other returns the peer role that is NOT role.
 func Other(role string) string {
@@ -95,9 +80,6 @@ func Load(path string) (*Config, error) {
 }
 
 func applyDefaults(cfg *Config) {
-	if cfg.Transport.Profile == "" {
-		cfg.Transport.Profile = ProfileLowLatency
-	}
 	if len(cfg.ICE.STUN) == 0 {
 		// Mix providers: single-provider outages are real (e.g. some ISPs
 		// block UDP to stun.l.google.com specifically), and ICE gathering
@@ -118,9 +100,6 @@ func validate(cfg *Config) error {
 	}
 	if cfg.Signaling.URL == "" {
 		return fmt.Errorf("signaling.url is required")
-	}
-	if !validProfiles[cfg.Transport.Profile] {
-		return fmt.Errorf("transport.profile %q invalid (want low-latency|balanced|bandwidth)", cfg.Transport.Profile)
 	}
 
 	for role := range cfg.Peers {

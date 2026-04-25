@@ -11,12 +11,6 @@ import (
 // pair creates a connected pair of Sessions over loopback UDP.
 // Peer A is the yamux/KCP server; B is the client.
 func pair(t *testing.T) (a, b *Session) {
-	return pairWithProfile(t, Profile("low-latency"))
-}
-
-// pairWithProfile is pair() but with an explicit KCP profile so individual
-// tests can compare behavior across presets.
-func pairWithProfile(t *testing.T, prof KCPProfile) (a, b *Session) {
 	t.Helper()
 	pcA, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {
@@ -33,11 +27,11 @@ func pairWithProfile(t *testing.T, prof KCPProfile) (a, b *Session) {
 	}
 	aCh := make(chan res, 1)
 	go func() {
-		s, err := Serve(pcA, prof)
+		s, err := Serve(pcA)
 		aCh <- res{s, err}
 	}()
 
-	bSess, err := Dial(pcB, pcA.LocalAddr().String(), prof)
+	bSess, err := Dial(pcB, pcA.LocalAddr().String())
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
@@ -168,7 +162,7 @@ func TestSession_multipleConcurrentStreams(t *testing.T) {
 // a large payload. Reproduces the round-E finding that bytes pushed by
 // the server after the client's header didn't arrive at the client.
 func TestSession_bulkServerPush_afterClientHeader(t *testing.T) {
-	a, b := pairWithProfile(t, Profile("low-latency"))
+	a, b := pair(t)
 
 	const payloadSize = 512 * 1024
 
@@ -221,7 +215,7 @@ func TestSession_bulkServerPush_afterClientHeader(t *testing.T) {
 // server writes in a loop for ~dur instead of one big s.Write. Goal is
 // to reproduce the real-world throughput-down behavior locally.
 func TestSession_continuousServerPush(t *testing.T) {
-	a, b := pairWithProfile(t, Profile("low-latency"))
+	a, b := pair(t)
 	const dur = 500 * time.Millisecond
 
 	type result struct{ wrote uint64; err error }
@@ -274,55 +268,22 @@ func TestSession_continuousServerPush(t *testing.T) {
 	t.Logf("server wrote %d bytes in %v, client received all of it", sv.wrote, dur)
 }
 
-// TestYamuxConfig_keepAliveIntervalKeepsICEWarm pins the contract that our
-// yamux keepalive fires often enough to be a reliable keep-warm signal for
-// the underlying pion/ICE path. Anything larger than a couple of seconds
-// leaves long silent windows on one side under asymmetric read-only loads
-// (the throughput-down bug in round F), so we require ≤ 2 s.
-func TestYamuxConfig_keepAliveIntervalKeepsICEWarm(t *testing.T) {
-	c := yamuxConfig()
-	if !c.EnableKeepAlive {
-		t.Fatalf("EnableKeepAlive=false; we rely on yamux pings as the keep-warm signal for pion/ICE")
+// TestQUICConfig_keepAliveKeepsICEWarm pins the contract that our QUIC
+// keepalive fires often enough to be a reliable keep-warm signal for the
+// underlying pion/ICE path. Anything larger than a couple of seconds
+// leaves long silent windows on one side under asymmetric read-only
+// loads (the throughput-down bug in round F), so we require ≤ 2 s.
+func TestQUICConfig_keepAliveKeepsICEWarm(t *testing.T) {
+	c := quicConfig()
+	if c.KeepAlivePeriod == 0 {
+		t.Fatalf("KeepAlivePeriod=0; we rely on QUIC PINGs as the keep-warm signal for pion/ICE")
 	}
-	if c.KeepAliveInterval > 2*time.Second {
-		t.Errorf("KeepAliveInterval=%v, want ≤ 2s so a read-only peer still emits outbound UDP often enough for ICE receive to stay healthy", c.KeepAliveInterval)
+	if c.KeepAlivePeriod > 2*time.Second {
+		t.Errorf("KeepAlivePeriod=%v, want ≤ 2s so a read-only peer still emits outbound UDP often enough for ICE receive to stay healthy", c.KeepAlivePeriod)
 	}
-	// Sanity: the write timeout must stay well above the interval so a
-	// single stalled Ping doesn't immediately kill the session.
-	if c.ConnectionWriteTimeout < 10*c.KeepAliveInterval {
-		t.Errorf("ConnectionWriteTimeout=%v < 10× KeepAliveInterval=%v; session would die on brief backpressure",
-			c.ConnectionWriteTimeout, c.KeepAliveInterval)
+	if c.MaxIdleTimeout < 10*c.KeepAlivePeriod {
+		t.Errorf("MaxIdleTimeout=%v < 10× KeepAlivePeriod=%v; session would die on brief backpressure",
+			c.MaxIdleTimeout, c.KeepAlivePeriod)
 	}
 }
 
-func TestProfile_lowLatencyDefault(t *testing.T) {
-	// Unknown name → low-latency preset.
-	p := Profile("never-heard-of-it")
-	low := Profile("low-latency")
-	if p != low {
-		t.Errorf("Profile(unknown) = %+v, want %+v", p, low)
-	}
-}
-
-func TestProfile_distinctPresets(t *testing.T) {
-	lo := Profile("low-latency")
-	bal := Profile("balanced")
-	bw := Profile("bandwidth")
-	if lo.Interval >= bal.Interval || bal.Interval >= bw.Interval {
-		t.Errorf("intervals not monotonically increasing: lo=%d bal=%d bw=%d",
-			lo.Interval, bal.Interval, bw.Interval)
-	}
-	// low-latency used to run with NC=1 (no cwnd) but that flooded
-	// asymmetric uplinks and killed the tunnel under sustained writes.
-	// It now matches "bandwidth" in having cwnd on — the distinguishing
-	// traits are shorter Interval and aggressive fast-resend.
-	if lo.NC != 0 {
-		t.Errorf("low-latency NC=%d, want 0 (cwnd on to avoid flooding)", lo.NC)
-	}
-	if bw.NC != 0 {
-		t.Errorf("bandwidth NC=%d, want 0 (cwnd on)", bw.NC)
-	}
-	if lo.Resend != 2 {
-		t.Errorf("low-latency Resend=%d, want 2 (fast rexmit on)", lo.Resend)
-	}
-}

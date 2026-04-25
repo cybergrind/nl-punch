@@ -63,7 +63,6 @@ func TestEndToEnd_loopback(t *testing.T) {
 	// auto-assign) and the server-side router dial localhost:echoPort.
 	cfg := &config.Config{
 		SessionID: "e2e",
-		Transport: config.TransportConfig{Profile: "low-latency"},
 		Peers: map[string]config.Peer{
 			"peer-a": {
 				// Peer-a here is the Listener side — its TCP listener
@@ -118,7 +117,7 @@ func TestEndToEnd_loopback(t *testing.T) {
 			return
 		}
 		pc := icepkg.NewPacketConn(iceConn)
-		sess, err := transport.Serve(pc, transport.Profile(cfg.Transport.Profile))
+		sess, err := transport.Serve(pc)
 		if err != nil {
 			iceConn.Close()
 			peerAOut <- peerOut{err: err}
@@ -156,7 +155,7 @@ func TestEndToEnd_loopback(t *testing.T) {
 			return
 		}
 		pc := icepkg.NewPacketConn(iceConn)
-		sess, err := transport.Dial(pc, pc.RemoteAddr().String(), transport.Profile(cfg.Transport.Profile))
+		sess, err := transport.Dial(pc, pc.RemoteAddr().String())
 		if err != nil {
 			iceConn.Close()
 			peerBOut <- peerOut{err: err}

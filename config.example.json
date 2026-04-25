@@ -12,9 +12,6 @@
     ],
     "turn": []
   },
-  "transport": {
-    "profile": "low-latency"
-  },
   "peers": {
     "peer-a": {
       "listen": [

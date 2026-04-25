@@ -65,7 +65,6 @@ func main() {
 		"role", *role,
 		"session", cfg.SessionID,
 		"signaling", cfg.Signaling.URL,
-		"transport", cfg.Transport.Profile,
 	)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -136,19 +135,18 @@ func runOnce(ctx context.Context, log *slog.Logger, cfg *config.Config, role str
 	)
 
 	pc := icepkg.NewPacketConn(iceConn)
-	profile := transport.Profile(cfg.Transport.Profile)
 
 	var sess *transport.Session
 	if role == config.RolePeerA {
-		sess, err = transport.Serve(pc, profile)
+		sess, err = transport.Serve(pc)
 	} else {
-		sess, err = transport.Dial(pc, pc.RemoteAddr().String(), profile)
+		sess, err = transport.Dial(pc, pc.RemoteAddr().String())
 	}
 	if err != nil {
 		return fmt.Errorf("transport: %w", err)
 	}
 	defer sess.Close()
-	log.Info("transport up", "profile", cfg.Transport.Profile, "role", role)
+	log.Info("transport up", "role", role)
 
 	me := cfg.Peers[role]
 	other := cfg.Peers[config.Other(role)]

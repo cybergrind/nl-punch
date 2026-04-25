@@ -12,7 +12,7 @@ reach.
 - No root / no TUN / no kernel extensions — runs as an unprivileged user process.
 - Static binary, CGO off. ~8 MB on `darwin/arm64`, ~9 MB on `linux/amd64`.
 - Multiplexed: many concurrent TCP connections share one UDP tunnel.
-- Tunable latency/bandwidth tradeoff via named KCP profiles.
+- One fixed KCP tuning chosen to stay up under load on asymmetric uplinks.
 
 ## Status
 
@@ -80,7 +80,6 @@ cat > /tmp/a.json <<'EOF'
 {
   "session_id": "test",
   "signaling": {"url": "http://127.0.0.1:8901/punch"},
-  "transport": {"profile": "low-latency"},
   "peers": {
     "peer-a": {"listen": [{"local_port": 9000, "remote_port": 8000, "name": "http"}]},
     "peer-b": {"dial":   [{"local_port": 8000, "name": "http"}]}
@@ -159,11 +158,6 @@ you have to replace. A full schema walk-through:
     ]
   },
 
-  "transport": {
-    // low-latency (default) | balanced | bandwidth — see "Transport profiles".
-    "profile": "low-latency"
-  },
-
   "peers": {
     // peer-a: the listener side. TCP clients connect to local_port;
     // bytes are tunneled to peer-b, which dials local_port on its side.
@@ -193,7 +187,6 @@ you have to replace. A full schema walk-through:
 | `signaling.shared_secret` | string | Optional. Sent as `X-Nl-Punch-Secret`; `${VAR}` expansion supported |
 | `ice.stun[]` | `["host:port", ...]` | STUN servers; defaults to Cloudflare + Google + Nextcloud |
 | `ice.turn[]` | `[{uri,user,pass}, ...]` | Optional TURN fallback |
-| `transport.profile` | string | `low-latency` \| `balanced` \| `bandwidth` (default: `low-latency`) |
 | `peers.<role>.listen[].name` | string | Stream tag; must be unique per peer and match the opposite side's tag |
 | `peers.<role>.listen[].local_port` | int | TCP port this peer binds on `127.0.0.1` |
 | `peers.<role>.listen[].remote_port` | int | Port the other peer dials when this stream arrives |
@@ -214,27 +207,18 @@ share one namespace per peer, so keep them unique across both blocks.
 
 ---
 
-## Transport profiles
+## Transport tuning
 
-KCP parameters are exposed as three named presets, picked with
-`transport.profile`. All three multiplex many streams over one UDP
-association; they differ in how aggressively KCP retransmits and paces
-its writes.
-
-| Profile | KCP `NoDelay(...)` | Window | Use case |
-|---------|---------------------|--------|----------|
-| `low-latency` (default) | `(1, 10, 2, 1)` | 1024 / 1024 pkts | Small chatty RPCs on a clean link. Fastest reaction to loss; highest bandwidth overhead |
-| `balanced`     | `(1, 20, 2, 1)` | 512 / 512 pkts  | Middle ground |
-| `bandwidth`    | `(0, 40, 0, 0)` | 1024 / 1024 pkts | Bulk transfers on a lossy or metered link. Congestion control enabled, slower recovery |
-
-The tuple is KCP's `(nodelay, interval_ms, resend, nc)`:
-- `nodelay=1` switches on KCP's fast-ack mode.
-- `interval` is the internal update tick (smaller = lower latency, more CPU and packets).
-- `resend` — retransmit after this many dup ACKs (0 disables fast-resend).
-- `nc=1` disables congestion control (lowest latency, no fairness).
-
-Stream-mode and ACK-no-delay are on for `low-latency` and `balanced`;
-off for `bandwidth`.
+KCP is configured with one fixed tuning: `NoDelay(0, 40, 0, 0)`,
+`SendWindow=RecvWindow=1024` packets, stream-mode on, ACK-no-delay off.
+Earlier versions exposed three named presets; the low-latency / balanced
+variants ran with `nc=1` (no congestion control) and small windows,
+which under sustained writes flooded asymmetric uplinks, starved
+return-path ACKs and yamux keepalives, and dropped the tunnel within
+~15 s. Only the surviving tuning is shipped, and it's no longer
+configurable. If you need a different profile, edit
+`internal/transport/profile.go` and rebuild — and please add a
+field-validation test that proves your tuning stays up under load.
 
 ---
 
@@ -306,7 +290,7 @@ Once both peers are running, you should see log lines like
 `nl-punch` writes structured text logs to stderr. Notable lines:
 
 - `ice state state=Connected role=peer-a` — ICE handshake succeeded.
-- `transport up profile=low-latency role=peer-a` — KCP+yamux ready.
+- `transport up role=peer-a` — KCP+yamux ready.
 - `tcp listener bound name=<tag> addr=127.0.0.1:<port> remote_port=<port>` — one line per configured listener.
 - `stats uptime=… streams_active=… bytes_in=… bytes_out=… mode=direct` — emitted every 30 s.
 - `session ended err=… uptime=…` → followed by `reconnecting wait=…` — full ICE restart with exponential backoff (1 s → 60 s, ±20% jitter).
@@ -327,7 +311,7 @@ nl-punch/
 │   ├── forward/               # TCP ↔ stream pump, tag framing
 │   ├── ice/                   # pion/ice wrapper + PacketConnAdapter
 │   ├── signaling/             # HTTP client + in-memory server
-│   └── transport/             # KCP + yamux session wrapper, profiles
+│   └── transport/             # KCP + yamux session wrapper, fixed tuning
 ├── config.example.json
 ├── Makefile
 └── go.mod
@@ -347,9 +331,9 @@ Package-by-package:
 
 | Package | What's covered |
 |---------|---------------|
-| `config`    | parse, env-expansion, default profile, role validation, name uniqueness, diverse-STUN defaults |
+| `config`    | parse, env-expansion, role validation, name uniqueness, diverse-STUN defaults |
 | `signaling` | offer/answer round-trip, secret auth, poll-and-await, 404 semantics |
-| `transport` | open/accept stream, concurrent streams, profile presets distinct |
+| `transport` | open/accept stream, concurrent streams, KCP tuning pinned |
 | `forward`   | listen→dial echo, unknown-tag rejection, 16 KB byte-exactness |
 | `ice`       | loopback handshake via in-memory signaling, timeout with no peer |
 | `cmd/nl-punch` | full pipeline: ICE → KCP → yamux → TCP echo |

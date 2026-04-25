@@ -2,7 +2,7 @@
 
 The Round-A→F sweeps in this repo gave us the first ground truth for how a
 studio-to-scheduler nl-punch tunnel actually performs. That sweep is
-useful, but it is narrow: one profile, one pair of machines, one network
+useful, but it is narrow: one tuning, one pair of machines, one network
 path, five-minute-class tests. This document collects concrete next
 experiments worth running before we rely on nl-punch for production
 NativeLink traffic.
@@ -94,17 +94,7 @@ Round D idle=5 min already passes. The original prod bug manifested at
   a week in CI against the real .132/.166 pair to catch regressions
   from ISP-level or upstream changes.
 
-### 6. Profile comparison
-
-We only measured `low-latency`. The `balanced` and `bandwidth` presets
-in `internal/transport/profile.go` are untested outside unit tests.
-
-- Add a `--profile` override to the bench client (it's already in the
-  config JSON — make it a flag in `deploy-and-bench.sh`). Run the
-  sweep three times, one per profile, and record a comparison table
-  in `bench-runs/profiles.md`.
-
-### 7. TURN fallback
+### 6. TURN fallback
 
 `cfg.ICE.TURN` is plumbed through but never exercised. When studio's
 STUN path is blocked (observed in the original Round-A incident
@@ -124,9 +114,9 @@ report), only TURN gets a tunnel up at all.
   be partly bounded by the local kernel, not the tunnel.
 - **Rotate the bench results dir** once per day so we don't lose the
   historical series under the accidental `mv` in `deploy-and-bench.sh`.
-- **Hash-check binaries before each run** and embed the git SHA + KCP
-  profile name into the JSONL `meta` event. Right now the label is a
-  free-form string and reruns are hard to compare.
+- **Hash-check binaries before each run** and embed the git SHA into
+  the JSONL `meta` event. Right now the label is a free-form string
+  and reruns are hard to compare.
 
 ### Diffing runs
 

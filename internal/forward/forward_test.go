@@ -134,7 +134,7 @@ func TestRoundTrip_unknownStreamTag(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := writeTag(s, "nonexistent"); err != nil {
+	if err := writeStreamHeader(s, streamHeader{tag: "nonexistent", sessionID: 1, stripeIdx: 0, numStripes: 1}); err != nil {
 		t.Fatal(err)
 	}
 	s.SetDeadline(time.Now().Add(3 * time.Second))
